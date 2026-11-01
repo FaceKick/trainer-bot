@@ -2,9 +2,10 @@ import asyncio
 import logging
 import sqlite3
 import re
+from datetime import datetime
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -29,6 +30,7 @@ cursor.execute("""
     )
 """)
 
+# Таблица упражнений
 cursor.execute("PRAGMA table_info(exercises)")
 columns = [col[1] for col in cursor.fetchall()]
 
@@ -83,6 +85,18 @@ else:
             counters[s_id] = counters.get(s_id, 0) + 1
             cursor.execute("UPDATE exercises SET order_num = ? WHERE id = ?", (counters[s_id], row_id))
 
+# Таблица истории выполнения тренировок
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS workout_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        client_id INTEGER,
+        split_id INTEGER,
+        exercise_id INTEGER,
+        exercise_name TEXT,
+        logged_details TEXT,
+        date_time TEXT
+    )
+""")
 conn.commit()
 
 # --- 2. НАСТРОЙКА БОТА ---
@@ -118,16 +132,18 @@ class DeleteExercise(StatesGroup):
     waiting_for_number = State()
     split_id = State()
 
-# --- 4. МЕХАНИЗМ АВТООЧИСТКИ СООБЩЕНИЙ ---
+class LiveWorkout(StatesGroup):
+    active = State()
+    waiting_custom_set = State()
+
+# --- 4. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И АВТООЧИСТКА ---
 async def save_msg(state: FSMContext, message_id: int):
-    """Сохраняет ID сообщений цепочки ввода для последующего удаления."""
     data = await state.get_data()
     msg_ids = data.get("messages_to_delete", [])
     msg_ids.append(message_id)
     await state.update_data(messages_to_delete=msg_ids)
 
 async def clear_old_messages(bot: Bot, chat_id: int, state: FSMContext):
-    """Удаляет все служебные сообщения и ответы ввода пользователя."""
     data = await state.get_data()
     msg_ids = data.get("messages_to_delete", [])
     for msg_id in msg_ids:
@@ -142,7 +158,30 @@ def get_cancel_keyboard():
         [InlineKeyboardButton(text="🔙 Назад / Скасувати", callback_data="cancel_action")]
     ])
 
-# --- 5. ОБРАБОТЧИКИ КОМАНД ---
+def parse_sets_string(details: str):
+    """Разбивает строку подходов вроде '60/10, 70/8, 70/8' на список."""
+    raw_sets = [s.strip() for s in details.split(",") if s.strip()]
+    parsed = []
+    for s in raw_sets:
+        match = re.search(r"([\d\.]+)\s*(?:[xXхХ/])\s*(\d+)", s)
+        if match:
+            w_str, r_str = match.groups()
+            w_val = float(w_str) if "." in w_str else int(w_str)
+            parsed.append({"weight": w_val, "reps": int(r_str), "raw": s})
+        else:
+            parsed.append({"weight": None, "reps": None, "raw": s})
+    return parsed if parsed else [{"weight": 0, "reps": 10, "raw": details}]
+
+def format_sets_string(sets_list):
+    res = []
+    for s in sets_list:
+        if s.get("weight") is not None and s.get("reps") is not None:
+            res.append(f"{s['weight']}/{s['reps']}")
+        else:
+            res.append(s.get("raw", ""))
+    return ", ".join(res)
+
+# --- 5. СИСТЕМНЫЕ КОМАНДЫ (START, UPDATE, BACKUP) ---
 
 @router.message(Command("start"))
 async def cmd_start(message: Message):
@@ -150,12 +189,24 @@ async def cmd_start(message: Message):
         "Привіт! Я бот для управління тренуваннями.\n\n"
         "Доступні команди:\n"
         "/add - Додати нового клієнта\n"
-        "/clients - Переглянути клієнтів та їх спліти"
+        "/clients - Переглянути клієнтів та їх спліти\n"
+        "/backup - Отримати копію бази даних"
     )
 
 @router.message(Command("myid"))
 async def cmd_myid(message: Message):
     await message.answer(f"Твій ID: <code>{message.from_user.id}</code>", parse_mode="HTML")
+
+@router.message(Command("backup"))
+async def cmd_backup(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ У вас немає прав для цієї команди.")
+        return
+    if os.path.exists("clients.db"):
+        file = FSInputFile("clients.db", filename=f"backup_clients_{datetime.now().strftime('%Y%m%d_%H%M')}.db")
+        await message.answer_document(file, caption="📦 Свіжа копія бази даних.")
+    else:
+        await message.answer("⚠️ Базу даних ще не створено.")
 
 @router.message(Command("update"))
 async def cmd_update_bot(message: Message):
@@ -183,7 +234,8 @@ async def process_cancel(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("❌ Дію скасовано.\n\nСкористайтеся /clients або /add")
     await callback.answer()
 
-# --- ДОБАВЛЕНИЕ КЛИЕНТА ---
+# --- 6. ДОБАВЛЕНИЕ КЛИЕНТА И ПЕРВОГО СПЛИТА ---
+
 @router.message(Command("add"))
 async def cmd_add_client(message: Message, state: FSMContext):
     await clear_old_messages(bot, message.chat.id, state)
@@ -236,7 +288,7 @@ async def process_split_name(message: Message, state: FSMContext):
     await clear_old_messages(bot, message.chat.id, state)
 
     sent_msg = await message.answer(
-        "Відправте список вправ (назва та підходи через двокрапку).\nПриклад:\nЖим лежачи: 60/10, 70/8\nРозведення: 14/12",
+        "Відправте список вправ (назва та підходи через двокрапку).\nПриклад:\nЖим гантелей: 24/10, 26/8\nТяга блоку: 50/12, 55/10",
         reply_markup=get_cancel_keyboard()
     )
     await save_msg(state, sent_msg.message_id)
@@ -277,12 +329,13 @@ async def process_split_exercises(message: Message, state: FSMContext):
     builder.adjust(1)
 
     await message.answer(
-        f"✅ Спліт <b>{split_name}</b> успішно збережено!\nДодано вправ: {added_count}",
+        f"✅ Спліт <b>{split_name}</b> збережено!\nДодано вправ: {added_count}",
         reply_markup=builder.as_markup(),
         parse_mode="HTML"
     )
 
-# --- ПРОСМОТР КЛИЕНТОВ ---
+# --- 7. ПРОСМОТР КЛИЕНТОВ И СПЛИТОВ ---
+
 @router.message(Command("clients"))
 async def cmd_show_clients(message: Message, state: FSMContext):
     await clear_old_messages(bot, message.chat.id, state)
@@ -360,10 +413,11 @@ async def process_split_selection(callback: CallbackQuery, state: FSMContext):
     builder = InlineKeyboardBuilder()
     
     if exercises:
+        builder.button(text="▶️ Почати тренування", callback_data=f"start_workout_{split_id}")
         for ex_id, ex_name, ex_details, order_num in exercises:
             text += f"{order_num}. <b>{ex_name}</b>: {ex_details}\n"
-            short_name = ex_name[:15] + "..." if len(ex_name) > 15 else ex_name
-            builder.button(text=f"📝 {order_num}. {short_name}", callback_data=f"edit_weight_{ex_id}")
+            short_name = ex_name[:14] + ".." if len(ex_name) > 14 else ex_name
+            builder.button(text=f"📝 {order_num}. {short_name}", callback_data=f"ex_menu_{ex_id}")
     else:
         text += "<i>У цьому спліті поки немає вправ.</i>\n"
         
@@ -378,7 +432,243 @@ async def process_split_selection(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
     await callback.answer()
 
-# --- ДОБАВЛЕНИЕ УПРАЖНЕНИЯ ПО НОМЕРУ (ПОЗИЦИИ) ---
+# --- 8. МЕНЮ ВПРАВИ ТА ІСТОРІЯ ПРОГРЕСУ ---
+
+@router.callback_query(F.data.startswith("ex_menu_"))
+async def process_ex_menu(callback: CallbackQuery):
+    ex_id = callback.data.split("_")[2]
+    cursor.execute("SELECT id, split_id, name, details, order_num FROM exercises WHERE id = ?", (ex_id,))
+    row = cursor.fetchone()
+    if not row:
+        await callback.answer("Вправу не знайдено.")
+        return
+    _, split_id, name, details, order_num = row
+
+    text = f"🏋️ <b>Вправа №{order_num}: {name}</b>\nПоточні підходи: <code>{details}</code>\n\nОберіть дію:"
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📝 Редагувати вагу вручну", callback_data=f"edit_weight_{ex_id}")
+    builder.button(text="📈 Історія прогресу", callback_data=f"history_ex_{ex_id}")
+    builder.button(text="🔙 До спліту", callback_data=f"split_{split_id}")
+    builder.adjust(1)
+
+    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("history_ex_"))
+async def process_history_exercise(callback: CallbackQuery):
+    ex_id = callback.data.split("_")[2]
+    cursor.execute("SELECT name, split_id FROM exercises WHERE id = ?", (ex_id,))
+    ex_row = cursor.fetchone()
+    if not ex_row:
+        await callback.answer("Не знайдено.")
+        return
+    name, split_id = ex_row
+
+    cursor.execute("""
+        SELECT logged_details, date_time FROM workout_history 
+        WHERE exercise_id = ? ORDER BY id DESC LIMIT 10
+    """, (ex_id,))
+    logs = cursor.fetchall()
+
+    text = f"📈 <b>Історія прогресу: {name}</b>\n\n"
+    if logs:
+        for details, dt in logs:
+            text += f"🗓 <b>{dt}</b>: <code>{details}</code>\n"
+    else:
+        text += "<i>Записів тренувань ще немає. Почніть тренування через кнопку «Почати тренування»!</i>\n"
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 Назад до вправи", callback_data=f"ex_menu_{ex_id}")
+    builder.button(text="📋 До спліту", callback_data=f"split_{split_id}")
+    builder.adjust(1)
+
+    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+    await callback.answer()
+
+# --- 9. РЕЖИМ «ПРОВЕСТИ ТРЕНИРОВКУ» (LIVE WORKOUT С ПОДХОДАМИ И ШАГАМИ ДИСКОВ) ---
+
+async def render_live_workout(message_or_call, state: FSMContext, is_edit=True):
+    data = await state.get_data()
+    ex_index = data.get("workout_ex_index", 0)
+    exercises = data.get("workout_exercises", [])
+    
+    if ex_index >= len(exercises):
+        # Все упражнения закончены
+        split_id = data.get("split_id")
+        cursor.execute("SELECT client_id, name FROM splits WHERE id = ?", (split_id,))
+        split_row = cursor.fetchone()
+        client_id, split_name = split_row[0], split_row[1]
+        
+        await state.clear()
+        builder = InlineKeyboardBuilder()
+        builder.button(text="📋 Повернутися до спліту", callback_data=f"split_{split_id}")
+        builder.button(text="🏋️ До клієнта", callback_data=f"client_{client_id}")
+        builder.adjust(1)
+        
+        finish_text = f"🔥 <b>Тренування завершено!</b>\nСпліт: <b>{split_name}</b>\nВсі ваги зафіксовані в базі та збережені в історії прогресу."
+        if is_edit:
+            await message_or_call.message.edit_text(finish_text, reply_markup=builder.as_markup(), parse_mode="HTML")
+        else:
+            await message_or_call.answer(finish_text, reply_markup=builder.as_markup(), parse_mode="HTML")
+        return
+
+    cur_ex = exercises[ex_index]
+    sets = cur_ex["sets"]
+    cur_set_idx = cur_ex["cur_set_idx"]
+    
+    text = f"🔥 <b>ТРЕНУВАННЯ В ПРОЦЕСІ</b> (Вправа {ex_index + 1}/{len(exercises)})\n\n"
+    text += f"🏋️ <b>{cur_ex['order_num']}. {cur_ex['name']}</b>\n\n"
+    text += "<b>Підходи:</b>\n"
+    for i, s in enumerate(sets):
+        st_icon = "✅" if i < cur_set_idx else ("👉" if i == cur_set_idx else "⏳")
+        if s["weight"] is not None and s["reps"] is not None:
+            text += f"{st_icon} Підхід {i + 1}: <b>{s['weight']} кг x {s['reps']}</b>\n"
+        else:
+            text += f"{st_icon} Підхід {i + 1}: <b>{s['raw']}</b>\n"
+
+    # Кнопки быстрых шагов для активного подхода
+    builder = InlineKeyboardBuilder()
+    if cur_set_idx < len(sets):
+        # Ряд 1: Свободные веса / микро-шаг дисков (1.25, 2.5)
+        builder.button(text="-2.5", callback_data="wstep_-2.5")
+        builder.button(text="-1.25", callback_data="wstep_-1.25")
+        builder.button(text="+1.25", callback_data="wstep_+1.25")
+        builder.button(text="+2.5", callback_data="wstep_+2.5")
+        # Ряд 2: Большие диски / тренажеры (5, 10)
+        builder.button(text="-10", callback_data="wstep_-10")
+        builder.button(text="-5", callback_data="wstep_-5")
+        builder.button(text="+5", callback_data="wstep_+5")
+        builder.button(text="+10", callback_data="wstep_+10")
+        # Ряд 3: Ручной ввод
+        builder.button(text="✏️ Вказати підхід вручну", callback_data="wstep_custom")
+        # Ряд 4: Главная кнопка фиксации подхода
+        builder.button(text=f"✅ Зафіксувати підхід {cur_set_idx + 1}", callback_data="wstep_confirm_set")
+    else:
+        builder.button(text="➡️ Наступна вправа", callback_data="wstep_next_ex")
+
+    builder.button(text="❌ Завершити тренування", callback_data=f"split_{data.get('split_id')}")
+    builder.adjust(4, 4, 1, 1, 1)
+
+    if is_edit:
+        await message_or_call.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+    else:
+        await message_or_call.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+
+@router.callback_query(F.data.startswith("start_workout_"))
+async def process_start_workout(callback: CallbackQuery, state: FSMContext):
+    split_id = callback.data.split("_")[2]
+    cursor.execute("SELECT client_id FROM splits WHERE id = ?", (split_id,))
+    client_id = cursor.fetchone()[0]
+
+    cursor.execute("SELECT id, name, details, order_num FROM exercises WHERE split_id = ? ORDER BY order_num ASC", (split_id,))
+    rows = cursor.fetchall()
+    if not rows:
+        await callback.answer("У цьому спліті немає вправ для тренування.")
+        return
+
+    workout_exercises = []
+    for ex_id, name, details, order_num in rows:
+        workout_exercises.append({
+            "id": ex_id,
+            "name": name,
+            "order_num": order_num,
+            "sets": parse_sets_string(details),
+            "cur_set_idx": 0
+        })
+
+    await state.clear()
+    await state.set_state(LiveWorkout.active)
+    await state.update_data(
+        client_id=client_id,
+        split_id=split_id,
+        workout_ex_index=0,
+        workout_exercises=workout_exercises
+    )
+    await render_live_workout(callback, state, is_edit=True)
+    await callback.answer()
+
+@router.callback_query(LiveWorkout.active, F.data.startswith("wstep_"))
+async def process_workout_step_buttons(callback: CallbackQuery, state: FSMContext):
+    action = callback.data.split("_")[1]
+    data = await state.get_data()
+    ex_index = data.get("workout_ex_index", 0)
+    exercises = data.get("workout_exercises", [])
+    cur_ex = exercises[ex_index]
+    cur_set_idx = cur_ex["cur_set_idx"]
+
+    if action in ["+1.25", "-1.25", "+2.5", "-2.5", "+5", "-5", "+10", "-10"]:
+        delta = float(action)
+        cur_set = cur_ex["sets"][cur_set_idx]
+        if cur_set["weight"] is None:
+            cur_set["weight"] = 0
+            cur_set["reps"] = 10
+        cur_set["weight"] = max(0, round(cur_set["weight"] + delta, 2))
+        await state.update_data(workout_exercises=exercises)
+        await render_live_workout(callback, state, is_edit=True)
+        await callback.answer(f"Вага: {cur_set['weight']} кг")
+        return
+
+    elif action == "confirm_set":
+        cur_ex["cur_set_idx"] += 1
+        await state.update_data(workout_exercises=exercises)
+        await render_live_workout(callback, state, is_edit=True)
+        await callback.answer("Підхід зараховано!")
+        return
+
+    elif action == "next_ex":
+        # Сохраняем обновленные веса текущего упражнения в базу и в историю
+        formatted_details = format_sets_string(cur_ex["sets"])
+        cursor.execute("UPDATE exercises SET details = ? WHERE id = ?", (formatted_details, cur_ex["id"]))
+        
+        now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+        cursor.execute("""
+            INSERT INTO workout_history (client_id, split_id, exercise_id, exercise_name, logged_details, date_time)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (data["client_id"], data["split_id"], cur_ex["id"], cur_ex["name"], formatted_details, now_str))
+        conn.commit()
+
+        # Переход к следующему упражнению
+        data["workout_ex_index"] += 1
+        await state.update_data(workout_ex_index=data["workout_ex_index"])
+        await render_live_workout(callback, state, is_edit=True)
+        await callback.answer()
+        return
+
+    elif action == "custom":
+        await state.set_state(LiveWorkout.waiting_custom_set)
+        sent_msg = await callback.message.answer(
+            f"Введіть дані для підходу №{cur_set_idx + 1} (наприклад: <code>47.5/8</code> або <code>12/12</code>):",
+            reply_markup=get_cancel_keyboard(),
+            parse_mode="HTML"
+        )
+        await save_msg(state, sent_msg.message_id)
+        await callback.answer()
+
+@router.message(LiveWorkout.waiting_custom_set)
+async def process_custom_set_input(message: Message, state: FSMContext):
+    await save_msg(state, message.message_id)
+    text = message.text.strip()
+    data = await state.get_data()
+    exercises = data.get("workout_exercises", [])
+    ex_index = data.get("workout_ex_index", 0)
+    cur_ex = exercises[ex_index]
+    cur_set_idx = cur_ex["cur_set_idx"]
+
+    match = re.search(r"([\d\.]+)\s*(?:[xXхХ/])\s*(\d+)", text)
+    if match:
+        w_str, r_str = match.groups()
+        w_val = float(w_str) if "." in w_str else int(w_str)
+        cur_ex["sets"][cur_set_idx] = {"weight": w_val, "reps": int(r_str), "raw": text}
+    else:
+        cur_ex["sets"][cur_set_idx] = {"weight": None, "reps": None, "raw": text}
+
+    await clear_old_messages(bot, message.chat.id, state)
+    await state.set_state(LiveWorkout.active)
+    await state.update_data(workout_exercises=exercises)
+    await render_live_workout(message, state, is_edit=False)
+
+# --- 10. ДОБАВЛЕНИЕ УПРАЖНЕНИЯ ПО НОМЕРУ (ПОЗИЦИИ) ---
+
 @router.callback_query(F.data.startswith("ins_ex_"))
 async def process_insert_exercise_btn(callback: CallbackQuery, state: FSMContext):
     split_id = callback.data.split("_")[2]
@@ -457,7 +747,8 @@ async def process_exercise_data_save(message: Message, state: FSMContext):
     
     await message.answer(f"✅ Вправу <b>{ex_name}</b> додано під номером {target_pos}!", reply_markup=builder.as_markup(), parse_mode="HTML")
 
-# --- УДАЛЕНИЕ УПРАЖНЕНИЯ ПО НОМЕРУ ---
+# --- 11. УДАЛЕНИЕ УПРАЖНЕНИЯ ПО НОМЕРУ ---
+
 @router.callback_query(F.data.startswith("del_ex_"))
 async def process_del_exercise_btn(callback: CallbackQuery, state: FSMContext):
     split_id = callback.data.split("_")[2]
@@ -505,7 +796,8 @@ async def process_delete_exercise_confirm(message: Message, state: FSMContext):
     
     await message.answer(f"🗑️ Вправу №{deleted_num} (<b>{ex_name}</b>) видалено!", reply_markup=builder.as_markup(), parse_mode="HTML")
 
-# --- УПРАВЛЕНИЕ СПЛИТОМ: ДОБАВЛЕНИЕ, ПЕРЕИМЕНОВАНИЕ И УДАЛЕНИЕ ---
+# --- 12. УПРАВЛЕНИЕ СПЛИТОМ И КЛИЕНТОМ ---
+
 @router.callback_query(F.data.startswith("add_split_"))
 async def process_add_split_button(callback: CallbackQuery, state: FSMContext):
     client_id = callback.data.split("_")[2]
@@ -559,7 +851,6 @@ async def process_split_new_name(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("delete_split_"))
 async def process_delete_split(callback: CallbackQuery):
     split_id = callback.data.split("_")[2]
-    
     cursor.execute("SELECT client_id, name FROM splits WHERE id = ?", (split_id,))
     split_row = cursor.fetchone()
     
@@ -574,10 +865,8 @@ async def process_delete_split(callback: CallbackQuery):
         await callback.message.edit_text(f"🗑️ Спліт <b>{split_name}</b> видалено.", reply_markup=builder.as_markup(), parse_mode="HTML")
     else:
         await callback.message.edit_text("⚠️ Спліт вже видалено.")
-        
     await callback.answer()
 
-# --- НАВИГАЦИЯ И УДАЛЕНИЕ КЛИЕНТА ---
 @router.callback_query(F.data == "back_to_clients")
 async def process_back_to_clients(callback: CallbackQuery):
     cursor.execute("SELECT id, name FROM clients")
@@ -599,7 +888,6 @@ async def process_back_to_clients(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("delete_client_"))
 async def process_delete_client(callback: CallbackQuery):
     client_id = callback.data.split("_")[2]
-    
     cursor.execute("SELECT name FROM clients WHERE id = ?", (client_id,))
     client_row = cursor.fetchone()
     
@@ -619,10 +907,10 @@ async def process_delete_client(callback: CallbackQuery):
         )
     else:
         await callback.message.edit_text("⚠️ Клієнта вже не існує.")
-        
     await callback.answer()
 
-# --- ИЗМЕНЕНИЕ ВЕСА УПРАЖНЕНИЯ ---
+# --- 13. РУЧНОЕ ИЗМЕНЕНИЕ ВЕСА УПРАЖНЕНИЯ ---
+
 @router.callback_query(F.data.startswith("edit_weight_"))
 async def process_edit_weight(callback: CallbackQuery, state: FSMContext):
     ex_id = callback.data.split("_")[2]
@@ -661,7 +949,7 @@ async def update_weight_in_db(message: Message, state: FSMContext):
         reply_markup=builder.as_markup()
     )
 
-# --- ЗАПУСК БОТА ---
+# --- 14. ЗАПУСК БОТА ---
 async def main():
     logging.basicConfig(level=logging.INFO)
     dp.include_router(router)
