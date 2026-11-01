@@ -29,7 +29,6 @@ cursor.execute("""
     )
 """)
 
-# Проверка и создание/обновление таблицы exercises
 cursor.execute("PRAGMA table_info(exercises)")
 columns = [col[1] for col in cursor.fetchall()]
 
@@ -73,12 +72,10 @@ else:
         cursor.execute("DROP TABLE exercises")
         cursor.execute("ALTER TABLE exercises_new RENAME TO exercises")
 
-    # Добавляем order_num, если таблица со split_id уже была, но без нумерации
     cursor.execute("PRAGMA table_info(exercises)")
     current_cols = [col[1] for col in cursor.fetchall()]
     if "order_num" not in current_cols:
         cursor.execute("ALTER TABLE exercises ADD COLUMN order_num INTEGER DEFAULT 1")
-        # Проставляем базовую нумерацию для существующих записей
         cursor.execute("SELECT id, split_id FROM exercises ORDER BY id ASC")
         rows = cursor.fetchall()
         counters = {}
@@ -121,7 +118,25 @@ class DeleteExercise(StatesGroup):
     waiting_for_number = State()
     split_id = State()
 
-# --- 4. ВСПОМОГАТЕЛЬНЫЕ КЛАВИАТУРЫ ---
+# --- 4. МЕХАНИЗМ АВТООЧИСТКИ СООБЩЕНИЙ ---
+async def save_msg(state: FSMContext, message_id: int):
+    """Сохраняет ID сообщений цепочки ввода для последующего удаления."""
+    data = await state.get_data()
+    msg_ids = data.get("messages_to_delete", [])
+    msg_ids.append(message_id)
+    await state.update_data(messages_to_delete=msg_ids)
+
+async def clear_old_messages(bot: Bot, chat_id: int, state: FSMContext):
+    """Удаляет все служебные сообщения и ответы ввода пользователя."""
+    data = await state.get_data()
+    msg_ids = data.get("messages_to_delete", [])
+    for msg_id in msg_ids:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except Exception:
+            pass
+    await state.update_data(messages_to_delete=[])
+
 def get_cancel_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Назад / Скасувати", callback_data="cancel_action")]
@@ -163,6 +178,7 @@ async def cmd_update_bot(message: Message):
 
 @router.callback_query(F.data == "cancel_action")
 async def process_cancel(callback: CallbackQuery, state: FSMContext):
+    await clear_old_messages(bot, callback.message.chat.id, state)
     await state.clear()
     await callback.message.edit_text("❌ Дію скасовано.\n\nСкористайтеся /clients або /add")
     await callback.answer()
@@ -170,48 +186,65 @@ async def process_cancel(callback: CallbackQuery, state: FSMContext):
 # --- ДОБАВЛЕНИЕ КЛИЕНТА ---
 @router.message(Command("add"))
 async def cmd_add_client(message: Message, state: FSMContext):
-    await message.answer(
+    await clear_old_messages(bot, message.chat.id, state)
+    await state.clear()
+    
+    sent_msg = await message.answer(
         "Введіть ім'я клієнта (тільки букви, наприклад: <i>Влад</i>):",
         reply_markup=get_cancel_keyboard(),
         parse_mode="HTML"
     )
+    await save_msg(state, message.message_id)
+    await save_msg(state, sent_msg.message_id)
     await state.set_state(AddClientFlow.waiting_for_name)
 
 @router.message(AddClientFlow.waiting_for_name)
 async def process_client_name(message: Message, state: FSMContext):
+    await save_msg(state, message.message_id)
     name = message.text.strip()
+    
     if not re.match(r"^[a-zA-Zа-яА-ЯёЁіІїЇєЄґҐ\s\-]+$", name) or len(name) < 2:
-        await message.answer(
+        err_msg = await message.answer(
             "⚠️ <b>Некоректне ім'я!</b> Тільки букви без спецсимволів. Спробуйте ще раз:",
             reply_markup=get_cancel_keyboard(),
             parse_mode="HTML"
         )
+        await save_msg(state, err_msg.message_id)
         return
 
     cursor.execute("INSERT INTO clients (name) VALUES (?)", (name,))
     client_id = cursor.lastrowid
     conn.commit()
+
+    await clear_old_messages(bot, message.chat.id, state)
     
-    await state.clear()
-    await state.update_data(client_id=client_id, client_name=name)
-    await message.answer(
+    sent_msg = await message.answer(
         f"✅ Клієнт <b>{name}</b> доданий!\n\nТепер введіть назву першого спліту (наприклад: <i>Верх / День 1</i>):",
         reply_markup=get_cancel_keyboard(),
         parse_mode="HTML"
     )
+    await state.update_data(client_id=client_id, client_name=name)
+    await save_msg(state, sent_msg.message_id)
     await state.set_state(AddSplitFlow.waiting_for_split_name)
 
 @router.message(AddSplitFlow.waiting_for_split_name)
 async def process_split_name(message: Message, state: FSMContext):
-    await state.update_data(split_name=message.text.strip())
-    await message.answer(
+    await save_msg(state, message.message_id)
+    split_name = message.text.strip()
+    await state.update_data(split_name=split_name)
+    
+    await clear_old_messages(bot, message.chat.id, state)
+
+    sent_msg = await message.answer(
         "Відправте список вправ (назва та підходи через двокрапку).\nПриклад:\nЖим лежачи: 60/10, 70/8\nРозведення: 14/12",
         reply_markup=get_cancel_keyboard()
     )
+    await save_msg(state, sent_msg.message_id)
     await state.set_state(AddSplitFlow.waiting_for_exercises)
 
 @router.message(AddSplitFlow.waiting_for_exercises)
 async def process_split_exercises(message: Message, state: FSMContext):
+    await save_msg(state, message.message_id)
     data = await state.get_data()
     client_id = data['client_id']
     split_name = data['split_name']
@@ -235,12 +268,30 @@ async def process_split_exercises(message: Message, state: FSMContext):
             pass
             
     conn.commit()
-    await message.answer(f"✅ Спліт <b>{split_name}</b> успішно збережено!\nДодано вправ: {added_count}", parse_mode="HTML")
+    await clear_old_messages(bot, message.chat.id, state)
     await state.clear()
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📋 Відкрити спліт", callback_data=f"split_{split_id}")
+    builder.button(text="🏋️ До клієнта", callback_data=f"client_{client_id}")
+    builder.adjust(1)
+
+    await message.answer(
+        f"✅ Спліт <b>{split_name}</b> успішно збережено!\nДодано вправ: {added_count}",
+        reply_markup=builder.as_markup(),
+        parse_mode="HTML"
+    )
 
 # --- ПРОСМОТР КЛИЕНТОВ ---
 @router.message(Command("clients"))
-async def cmd_show_clients(message: Message):
+async def cmd_show_clients(message: Message, state: FSMContext):
+    await clear_old_messages(bot, message.chat.id, state)
+    await state.clear()
+    try:
+        await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+    except Exception:
+        pass
+
     cursor.execute("SELECT id, name FROM clients")
     clients = cursor.fetchall()
     
@@ -256,7 +307,10 @@ async def cmd_show_clients(message: Message):
     await message.answer("🏋️ Оберіть клієнта:", reply_markup=builder.as_markup())
 
 @router.callback_query(F.data.startswith("client_"))
-async def process_client_selection(callback: CallbackQuery):
+async def process_client_selection(callback: CallbackQuery, state: FSMContext):
+    await clear_old_messages(bot, callback.message.chat.id, state)
+    await state.clear()
+
     client_id = callback.data.split("_")[1]
     
     cursor.execute("SELECT name FROM clients WHERE id = ?", (client_id,))
@@ -285,7 +339,10 @@ async def process_client_selection(callback: CallbackQuery):
     await callback.answer()
 
 @router.callback_query(F.data.startswith("split_"))
-async def process_split_selection(callback: CallbackQuery):
+async def process_split_selection(callback: CallbackQuery, state: FSMContext):
+    await clear_old_messages(bot, callback.message.chat.id, state)
+    await state.clear()
+
     split_id = callback.data.split("_")[1]
     
     cursor.execute("SELECT name, client_id FROM splits WHERE id = ?", (split_id,))
@@ -331,17 +388,19 @@ async def process_insert_exercise_btn(callback: CallbackQuery, state: FSMContext
     count = cursor.fetchone()[0]
     next_pos = count + 1
     
-    await callback.message.answer(
+    sent_msg = await callback.message.answer(
         f"Введіть <b>номер позиції</b>, куди вставити вправу (від 1 до {next_pos}):\n"
-        f"<i>(Якщо хочете поставити в кінець списку — введіть {next_pos})</i>",
+        f"<i>(Якщо в кінець списку — введіть {next_pos})</i>",
         reply_markup=get_cancel_keyboard(),
         parse_mode="HTML"
     )
+    await save_msg(state, sent_msg.message_id)
     await state.set_state(InsertExercise.waiting_for_position)
     await callback.answer()
 
 @router.message(InsertExercise.waiting_for_position)
 async def process_position_step(message: Message, state: FSMContext):
+    await save_msg(state, message.message_id)
     data = await state.get_data()
     split_id = data['split_id']
     
@@ -353,37 +412,43 @@ async def process_position_step(message: Message, state: FSMContext):
         if pos < 1 or pos > count + 1:
             raise ValueError
     except ValueError:
-        await message.answer(f"⚠️ Будь ласка, введіть коректне число від 1 до {count + 1}:", reply_markup=get_cancel_keyboard())
+        err_msg = await message.answer(f"⚠️ Введіть коректне число від 1 до {count + 1}:", reply_markup=get_cancel_keyboard())
+        await save_msg(state, err_msg.message_id)
         return
 
     await state.update_data(target_pos=pos)
-    await message.answer(
+    await clear_old_messages(bot, message.chat.id, state)
+    
+    sent_msg = await message.answer(
         f"Введіть вправу для позиції №{pos} у форматі:\n<b>Назва: підходи/вага</b>\n\nПриклад:\nПідтягування: 4х10, +10кг/6",
         reply_markup=get_cancel_keyboard(),
         parse_mode="HTML"
     )
+    await save_msg(state, sent_msg.message_id)
     await state.set_state(InsertExercise.waiting_for_data)
 
 @router.message(InsertExercise.waiting_for_data)
 async def process_exercise_data_save(message: Message, state: FSMContext):
+    await save_msg(state, message.message_id)
     data = await state.get_data()
     split_id = data['split_id']
     target_pos = data['target_pos']
     
     text = message.text.strip()
     if ":" not in text:
-        await message.answer("⚠️ Розділіть назву і вагу двокрапкою (наприклад: <i>Тяга: 50/10</i>):", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
+        err_msg = await message.answer("⚠️ Розділіть назву і вагу двокрапкою (наприклад: <i>Тяга: 50/10</i>):", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
+        await save_msg(state, err_msg.message_id)
         return
         
     parts = text.split(":", 1)
     ex_name = parts[0].strip()
     ex_details = parts[1].strip()
 
-    # Сдвигаем все последующие упражнения вниз
     cursor.execute("UPDATE exercises SET order_num = order_num + 1 WHERE split_id = ? AND order_num >= ?", (split_id, target_pos))
-    # Вставляем новое упражнение на выбранное место
     cursor.execute("INSERT INTO exercises (split_id, name, details, order_num) VALUES (?, ?, ?, ?)", (split_id, ex_name, ex_details, target_pos))
     conn.commit()
+
+    await clear_old_messages(bot, message.chat.id, state)
     await state.clear()
     
     builder = InlineKeyboardBuilder()
@@ -401,16 +466,18 @@ async def process_del_exercise_btn(callback: CallbackQuery, state: FSMContext):
     cursor.execute("SELECT COUNT(*) FROM exercises WHERE split_id = ?", (split_id,))
     count = cursor.fetchone()[0]
     
-    await callback.message.answer(
+    sent_msg = await callback.message.answer(
         f"Введіть <b>номер вправи</b>, яку потрібно видалити (від 1 до {count}):",
         reply_markup=get_cancel_keyboard(),
         parse_mode="HTML"
     )
+    await save_msg(state, sent_msg.message_id)
     await state.set_state(DeleteExercise.waiting_for_number)
     await callback.answer()
 
 @router.message(DeleteExercise.waiting_for_number)
 async def process_delete_exercise_confirm(message: Message, state: FSMContext):
+    await save_msg(state, message.message_id)
     data = await state.get_data()
     split_id = data['split_id']
     
@@ -418,17 +485,18 @@ async def process_delete_exercise_confirm(message: Message, state: FSMContext):
     row = cursor.fetchone()
     
     if not row:
-        await message.answer("⚠️ Вправу з таким номером не знайдено. Спробуйте ще раз:", reply_markup=get_cancel_keyboard())
+        err_msg = await message.answer("⚠️ Вправу з таким номером не знайдено. Спробуйте ще раз:", reply_markup=get_cancel_keyboard())
+        await save_msg(state, err_msg.message_id)
         return
 
     ex_id, ex_name = row
     deleted_num = int(message.text.strip())
     
-    # Удаляем упражнение
     cursor.execute("DELETE FROM exercises WHERE id = ?", (ex_id,))
-    # Сдвигаем номера оставшихся упражнений вверх
     cursor.execute("UPDATE exercises SET order_num = order_num - 1 WHERE split_id = ? AND order_num > ?", (split_id, deleted_num))
     conn.commit()
+
+    await clear_old_messages(bot, message.chat.id, state)
     await state.clear()
     
     builder = InlineKeyboardBuilder()
@@ -437,7 +505,7 @@ async def process_delete_exercise_confirm(message: Message, state: FSMContext):
     
     await message.answer(f"🗑️ Вправу №{deleted_num} (<b>{ex_name}</b>) видалено!", reply_markup=builder.as_markup(), parse_mode="HTML")
 
-# --- УПРАВЛЕНИЕ СПЛИТОМ: ПЕРЕИМЕНОВАНИЕ И УДАЛЕНИЕ СПЛИТА ---
+# --- УПРАВЛЕНИЕ СПЛИТОМ: ДОБАВЛЕНИЕ, ПЕРЕИМЕНОВАНИЕ И УДАЛЕНИЕ ---
 @router.callback_query(F.data.startswith("add_split_"))
 async def process_add_split_button(callback: CallbackQuery, state: FSMContext):
     client_id = callback.data.split("_")[2]
@@ -445,11 +513,12 @@ async def process_add_split_button(callback: CallbackQuery, state: FSMContext):
     client_row = cursor.fetchone()
     
     await state.update_data(client_id=client_id, client_name=client_row[0])
-    await callback.message.answer(
+    sent_msg = await callback.message.answer(
         "Введіть назву нового спліту (наприклад: <i>Низ / День 2</i>):", 
         reply_markup=get_cancel_keyboard(),
         parse_mode="HTML"
     )
+    await save_msg(state, sent_msg.message_id)
     await state.set_state(AddSplitFlow.waiting_for_split_name)
     await callback.answer()
 
@@ -457,15 +526,17 @@ async def process_add_split_button(callback: CallbackQuery, state: FSMContext):
 async def process_rename_split(callback: CallbackQuery, state: FSMContext):
     split_id = callback.data.split("_")[2]
     await state.update_data(split_id=split_id)
-    await callback.message.answer(
+    sent_msg = await callback.message.answer(
         "Введіть нову назву для цього спліту:", 
         reply_markup=get_cancel_keyboard()
     )
+    await save_msg(state, sent_msg.message_id)
     await state.set_state(EditSplitName.waiting_for_new_name)
     await callback.answer()
 
 @router.message(EditSplitName.waiting_for_new_name)
 async def process_split_new_name(message: Message, state: FSMContext):
+    await save_msg(state, message.message_id)
     data = await state.get_data()
     split_id = data['split_id']
     new_name = message.text.strip()
@@ -474,8 +545,10 @@ async def process_split_new_name(message: Message, state: FSMContext):
     cursor.execute("SELECT client_id FROM splits WHERE id = ?", (split_id,))
     client_id = cursor.fetchone()[0]
     conn.commit()
-    
+
+    await clear_old_messages(bot, message.chat.id, state)
     await state.clear()
+    
     builder = InlineKeyboardBuilder()
     builder.button(text="🔙 До спліту", callback_data=f"split_{split_id}")
     builder.button(text="🏋️ До клієнта", callback_data=f"client_{client_id}")
@@ -555,15 +628,17 @@ async def process_edit_weight(callback: CallbackQuery, state: FSMContext):
     ex_id = callback.data.split("_")[2]
     await state.update_data(exercise_id=ex_id)
     
-    await state.set_state(EditWeight.waiting_for_new_weight)
-    await callback.message.answer(
+    sent_msg = await callback.message.answer(
         "Введіть нові дані (наприклад: 40/12, 50/10):",
         reply_markup=get_cancel_keyboard()
     )
+    await save_msg(state, sent_msg.message_id)
+    await state.set_state(EditWeight.waiting_for_new_weight)
     await callback.answer()
 
 @router.message(EditWeight.waiting_for_new_weight)
 async def update_weight_in_db(message: Message, state: FSMContext):
+    await save_msg(state, message.message_id)
     data = await state.get_data()
     ex_id = data['exercise_id']
     new_details = message.text
@@ -572,6 +647,8 @@ async def update_weight_in_db(message: Message, state: FSMContext):
     cursor.execute("SELECT split_id FROM exercises WHERE id = ?", (ex_id,))
     split_row = cursor.fetchone()
     conn.commit()
+
+    await clear_old_messages(bot, message.chat.id, state)
     await state.clear()
 
     builder = InlineKeyboardBuilder()
