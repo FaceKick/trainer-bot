@@ -11,10 +11,11 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 import subprocess
 import os
 
-# --- 1. БАЗА ДАННЫХ ---
+# --- 1. БАЗА ДАННЫХ И АВТОМАТИЧЕСКАЯ МИГРАЦИЯ ---
 conn = sqlite3.connect("clients.db")
 cursor = conn.cursor()
 
+# Создаем базовые таблицы (если их еще нет)
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS clients (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -28,14 +29,61 @@ cursor.execute("""
         name TEXT
     )
 """)
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS exercises (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        split_id INTEGER,
-        name TEXT,
-        details TEXT
-    )
-""")
+
+# Проверяем структуру существующей таблицы exercises
+cursor.execute("PRAGMA table_info(exercises)")
+columns = [col[1] for col in cursor.fetchall()]
+
+if not columns:
+    # Таблицы еще нет — создаем сразу в новом формате
+    cursor.execute("""
+        CREATE TABLE exercises (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            split_id INTEGER,
+            name TEXT,
+            details TEXT
+        )
+    """)
+elif "split_id" not in columns:
+    # Таблица есть, но в старом формате (с client_id) — аккуратно мигрируем данные!
+    print("🔄 Обнаружена старая версия базы. Выполняется автоматическая миграция...")
+    
+    # 1. Для каждого клиента, у которого были упражнения, создаем сплит по умолчанию
+    cursor.execute("SELECT DISTINCT client_id, split_name FROM exercises")
+    old_splits = cursor.fetchall()
+    
+    # Временный словарь старых сплитов: (client_id, split_name) -> new_split_id
+    split_map = {}
+    for c_id, s_name in old_splits:
+        name_to_use = s_name if s_name else "Основний спліт"
+        cursor.execute("INSERT INTO splits (client_id, name) VALUES (?, ?)", (c_id, name_to_use))
+        split_map[(c_id, s_name)] = cursor.lastrowid
+
+    # 2. Создаем новую временную таблицу под правильную структуру
+    cursor.execute("""
+        CREATE TABLE exercises_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            split_id INTEGER,
+            name TEXT,
+            details TEXT
+        )
+    """)
+
+    # 3. Переносим все существующие упражнения, привязывая их к новым сплитам
+    cursor.execute("SELECT id, client_id, split_name, name, details FROM exercises")
+    old_exercises = cursor.fetchall()
+    for ex_id, c_id, s_name, ex_name, ex_details in old_exercises:
+        new_split_id = split_map.get((c_id, s_name))
+        cursor.execute(
+            "INSERT INTO exercises_new (id, split_id, name, details) VALUES (?, ?, ?, ?)",
+            (ex_id, new_split_id, ex_name, ex_details)
+        )
+
+    # 4. Заменяем старую таблицу новой
+    cursor.execute("DROP TABLE exercises")
+    cursor.execute("ALTER TABLE exercises_new RENAME TO exercises")
+    print("✅ Миграция завершена! Все клиенты и упражнения сохранены.")
+
 conn.commit()
 
 # --- 2. НАСТРОЙКА БОТА ---
