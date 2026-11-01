@@ -485,7 +485,7 @@ async def process_history_exercise(callback: CallbackQuery):
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
     await callback.answer()
 
-# --- 9. РЕЖИМ «ПРОВЕСТИ ТРЕНИРОВКУ» (ИСПРАВЛЕННЫЙ БЛОК) ---
+# --- 9. РЕЖИМ «ПРОВЕСТИ ТРЕНИРОВКУ» (LIVE WORKOUT С ПОДХОДАМИ И ШАГАМИ ДИСКОВ) ---
 
 async def render_live_workout(message_or_call, state: FSMContext, is_edit=True):
     data = await state.get_data()
@@ -506,7 +506,10 @@ async def render_live_workout(message_or_call, state: FSMContext, is_edit=True):
         
         finish_text = f"🔥 <b>Тренування завершено!</b>\nСпліт: <b>{split_name}</b>\nВсі ваги зафіксовані в базі та збережені в історії прогресу."
         if is_edit:
-            await message_or_call.message.edit_text(finish_text, reply_markup=builder.as_markup(), parse_mode="HTML")
+            try:
+                await message_or_call.message.edit_text(finish_text, reply_markup=builder.as_markup(), parse_mode="HTML")
+            except Exception:
+                pass
         else:
             await message_or_call.answer(finish_text, reply_markup=builder.as_markup(), parse_mode="HTML")
         return
@@ -555,6 +558,39 @@ async def render_live_workout(message_or_call, state: FSMContext, is_edit=True):
             pass
     else:
         await message_or_call.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+
+@router.callback_query(F.data.startswith("start_workout_"))
+async def process_start_workout(callback: CallbackQuery, state: FSMContext):
+    split_id = callback.data.split("_")[2]
+    cursor.execute("SELECT client_id FROM splits WHERE id = ?", (split_id,))
+    client_id = cursor.fetchone()[0]
+
+    cursor.execute("SELECT id, name, details, order_num FROM exercises WHERE split_id = ? ORDER BY order_num ASC", (split_id,))
+    rows = cursor.fetchall()
+    if not rows:
+        await callback.answer("У цьому спліті немає вправ для тренування.")
+        return
+
+    workout_exercises = []
+    for ex_id, name, details, order_num in rows:
+        workout_exercises.append({
+            "id": ex_id,
+            "name": name,
+            "order_num": order_num,
+            "sets": parse_sets_string(details),
+            "cur_set_idx": 0
+        })
+
+    await state.clear()
+    await state.set_state(LiveWorkout.active)
+    await state.update_data(
+        client_id=client_id,
+        split_id=split_id,
+        workout_ex_index=0,
+        workout_exercises=workout_exercises
+    )
+    await render_live_workout(callback, state, is_edit=True)
+    await callback.answer()
 
 @router.callback_query(LiveWorkout.active, F.data.startswith("wstep_"))
 async def process_workout_step_buttons(callback: CallbackQuery, state: FSMContext):
