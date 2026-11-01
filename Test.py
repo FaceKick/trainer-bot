@@ -11,7 +11,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 import subprocess
 import os
 
-# --- 1. БАЗА ДАННЫХ И АВТОМАТИЧЕСКАЯ МИГРАЦИЯ ---
+# --- 1. БАЗА ДАННЫХ И МИГРАЦИИ ---
 conn = sqlite3.connect("clients.db")
 cursor = conn.cursor()
 
@@ -29,6 +29,7 @@ cursor.execute("""
     )
 """)
 
+# Проверка и создание/обновление таблицы exercises
 cursor.execute("PRAGMA table_info(exercises)")
 columns = [col[1] for col in cursor.fetchall()]
 
@@ -38,39 +39,52 @@ if not columns:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             split_id INTEGER,
             name TEXT,
-            details TEXT
+            details TEXT,
+            order_num INTEGER DEFAULT 1
         )
     """)
-elif "split_id" not in columns:
-    cursor.execute("SELECT DISTINCT client_id, split_name FROM exercises")
-    old_splits = cursor.fetchall()
-    
-    split_map = {}
-    for c_id, s_name in old_splits:
-        name_to_use = s_name if s_name else "Основний спліт"
-        cursor.execute("INSERT INTO splits (client_id, name) VALUES (?, ?)", (c_id, name_to_use))
-        split_map[(c_id, s_name)] = cursor.lastrowid
+else:
+    if "split_id" not in columns:
+        cursor.execute("SELECT DISTINCT client_id, split_name FROM exercises")
+        old_splits = cursor.fetchall()
+        split_map = {}
+        for c_id, s_name in old_splits:
+            name_to_use = s_name if s_name else "Основний спліт"
+            cursor.execute("INSERT INTO splits (client_id, name) VALUES (?, ?)", (c_id, name_to_use))
+            split_map[(c_id, s_name)] = cursor.lastrowid
 
-    cursor.execute("""
-        CREATE TABLE exercises_new (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            split_id INTEGER,
-            name TEXT,
-            details TEXT
-        )
-    """)
+        cursor.execute("""
+            CREATE TABLE exercises_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                split_id INTEGER,
+                name TEXT,
+                details TEXT,
+                order_num INTEGER DEFAULT 1
+            )
+        """)
+        cursor.execute("SELECT id, client_id, split_name, name, details FROM exercises")
+        old_exercises = cursor.fetchall()
+        for ex_id, c_id, s_name, ex_name, ex_details in old_exercises:
+            new_split_id = split_map.get((c_id, s_name))
+            cursor.execute(
+                "INSERT INTO exercises_new (id, split_id, name, details, order_num) VALUES (?, ?, ?, ?, 1)",
+                (ex_id, new_split_id, ex_name, ex_details)
+            )
+        cursor.execute("DROP TABLE exercises")
+        cursor.execute("ALTER TABLE exercises_new RENAME TO exercises")
 
-    cursor.execute("SELECT id, client_id, split_name, name, details FROM exercises")
-    old_exercises = cursor.fetchall()
-    for ex_id, c_id, s_name, ex_name, ex_details in old_exercises:
-        new_split_id = split_map.get((c_id, s_name))
-        cursor.execute(
-            "INSERT INTO exercises_new (id, split_id, name, details) VALUES (?, ?, ?, ?)",
-            (ex_id, new_split_id, ex_name, ex_details)
-        )
-
-    cursor.execute("DROP TABLE exercises")
-    cursor.execute("ALTER TABLE exercises_new RENAME TO exercises")
+    # Добавляем order_num, если таблица со split_id уже была, но без нумерации
+    cursor.execute("PRAGMA table_info(exercises)")
+    current_cols = [col[1] for col in cursor.fetchall()]
+    if "order_num" not in current_cols:
+        cursor.execute("ALTER TABLE exercises ADD COLUMN order_num INTEGER DEFAULT 1")
+        # Проставляем базовую нумерацию для существующих записей
+        cursor.execute("SELECT id, split_id FROM exercises ORDER BY id ASC")
+        rows = cursor.fetchall()
+        counters = {}
+        for row_id, s_id in rows:
+            counters[s_id] = counters.get(s_id, 0) + 1
+            cursor.execute("UPDATE exercises SET order_num = ? WHERE id = ?", (counters[s_id], row_id))
 
 conn.commit()
 
@@ -98,8 +112,13 @@ class EditSplitName(StatesGroup):
     waiting_for_new_name = State()
     split_id = State()
 
-class AppendExercises(StatesGroup):
-    waiting_for_exercises = State()
+class InsertExercise(StatesGroup):
+    waiting_for_position = State()
+    waiting_for_data = State()
+    split_id = State()
+
+class DeleteExercise(StatesGroup):
+    waiting_for_number = State()
     split_id = State()
 
 # --- 4. ВСПОМОГАТЕЛЬНЫЕ КЛАВИАТУРЫ ---
@@ -161,7 +180,6 @@ async def cmd_add_client(message: Message, state: FSMContext):
 @router.message(AddClientFlow.waiting_for_name)
 async def process_client_name(message: Message, state: FSMContext):
     name = message.text.strip()
-    
     if not re.match(r"^[a-zA-Zа-яА-ЯёЁіІїЇєЄґҐ\s\-]+$", name) or len(name) < 2:
         await message.answer(
             "⚠️ <b>Некоректне ім'я!</b> Тільки букви без спецсимволів. Спробуйте ще раз:",
@@ -187,7 +205,7 @@ async def process_client_name(message: Message, state: FSMContext):
 async def process_split_name(message: Message, state: FSMContext):
     await state.update_data(split_name=message.text.strip())
     await message.answer(
-        "Відправте список вправ (назва та підходи через двокрапку).\nПриклад:\nЖим лежачи: 60/10, 70/8",
+        "Відправте список вправ (назва та підходи через двокрапку).\nПриклад:\nЖим лежачи: 60/10, 70/8\nРозведення: 14/12",
         reply_markup=get_cancel_keyboard()
     )
     await state.set_state(AddSplitFlow.waiting_for_exercises)
@@ -208,11 +226,11 @@ async def process_split_exercises(message: Message, state: FSMContext):
             continue
         try:
             parts = line.split(':', 1)
-            cursor.execute(
-                "INSERT INTO exercises (split_id, name, details) VALUES (?, ?, ?)",
-                (split_id, parts[0].strip(), parts[1].strip())
-            )
             added_count += 1
+            cursor.execute(
+                "INSERT INTO exercises (split_id, name, details, order_num) VALUES (?, ?, ?, ?)",
+                (split_id, parts[0].strip(), parts[1].strip(), added_count)
+            )
         except Exception:
             pass
             
@@ -278,22 +296,24 @@ async def process_split_selection(callback: CallbackQuery):
         return
     split_name, client_id = split_row
     
-    cursor.execute("SELECT id, name, details FROM exercises WHERE split_id = ?", (split_id,))
+    cursor.execute("SELECT id, name, details, order_num FROM exercises WHERE split_id = ? ORDER BY order_num ASC", (split_id,))
     exercises = cursor.fetchall()
     
     text = f"📋 <b>Спліт:</b> {split_name}\n\n"
     builder = InlineKeyboardBuilder()
     
     if exercises:
-        for i, (ex_id, ex_name, ex_details) in enumerate(exercises, 1):
-            text += f"{i}. <b>{ex_name}</b>: {ex_details}\n"
+        for ex_id, ex_name, ex_details, order_num in exercises:
+            text += f"{order_num}. <b>{ex_name}</b>: {ex_details}\n"
             short_name = ex_name[:15] + "..." if len(ex_name) > 15 else ex_name
-            builder.button(text=f"📝 {short_name}", callback_data=f"edit_weight_{ex_id}")
+            builder.button(text=f"📝 {order_num}. {short_name}", callback_data=f"edit_weight_{ex_id}")
     else:
         text += "<i>У цьому спліті поки немає вправ.</i>\n"
         
+    builder.button(text="➕ Додати вправу по номеру", callback_data=f"ins_ex_{split_id}")
+    if exercises:
+        builder.button(text="🗑️ Видалити вправу по номеру", callback_data=f"del_ex_{split_id}")
     builder.button(text="✏️ Перейменувати спліт", callback_data=f"rename_split_{split_id}")
-    builder.button(text="➕ Додати вправи у спліт", callback_data=f"append_ex_{split_id}")
     builder.button(text="🗑️ Видалити цей спліт", callback_data=f"delete_split_{split_id}")
     builder.button(text="🔙 Назад до клієнта", callback_data=f"client_{client_id}")
     builder.adjust(1)
@@ -301,8 +321,123 @@ async def process_split_selection(callback: CallbackQuery):
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
     await callback.answer()
 
-# --- УПРАВЛЕНИЕ СПЛИТОМ: ДОБАВЛЕНИЕ, ПЕРЕИМЕНОВАНИЕ, УДАЛЕНИЕ ---
+# --- ДОБАВЛЕНИЕ УПРАЖНЕНИЯ ПО НОМЕРУ (ПОЗИЦИИ) ---
+@router.callback_query(F.data.startswith("ins_ex_"))
+async def process_insert_exercise_btn(callback: CallbackQuery, state: FSMContext):
+    split_id = callback.data.split("_")[2]
+    await state.update_data(split_id=split_id)
+    
+    cursor.execute("SELECT COUNT(*) FROM exercises WHERE split_id = ?", (split_id,))
+    count = cursor.fetchone()[0]
+    next_pos = count + 1
+    
+    await callback.message.answer(
+        f"Введіть <b>номер позиції</b>, куди вставити вправу (від 1 до {next_pos}):\n"
+        f"<i>(Якщо хочете поставити в кінець списку — введіть {next_pos})</i>",
+        reply_markup=get_cancel_keyboard(),
+        parse_mode="HTML"
+    )
+    await state.set_state(InsertExercise.waiting_for_position)
+    await callback.answer()
 
+@router.message(InsertExercise.waiting_for_position)
+async def process_position_step(message: Message, state: FSMContext):
+    data = await state.get_data()
+    split_id = data['split_id']
+    
+    cursor.execute("SELECT COUNT(*) FROM exercises WHERE split_id = ?", (split_id,))
+    count = cursor.fetchone()[0]
+    
+    try:
+        pos = int(message.text.strip())
+        if pos < 1 or pos > count + 1:
+            raise ValueError
+    except ValueError:
+        await message.answer(f"⚠️ Будь ласка, введіть коректне число від 1 до {count + 1}:", reply_markup=get_cancel_keyboard())
+        return
+
+    await state.update_data(target_pos=pos)
+    await message.answer(
+        f"Введіть вправу для позиції №{pos} у форматі:\n<b>Назва: підходи/вага</b>\n\nПриклад:\nПідтягування: 4х10, +10кг/6",
+        reply_markup=get_cancel_keyboard(),
+        parse_mode="HTML"
+    )
+    await state.set_state(InsertExercise.waiting_for_data)
+
+@router.message(InsertExercise.waiting_for_data)
+async def process_exercise_data_save(message: Message, state: FSMContext):
+    data = await state.get_data()
+    split_id = data['split_id']
+    target_pos = data['target_pos']
+    
+    text = message.text.strip()
+    if ":" not in text:
+        await message.answer("⚠️ Розділіть назву і вагу двокрапкою (наприклад: <i>Тяга: 50/10</i>):", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
+        return
+        
+    parts = text.split(":", 1)
+    ex_name = parts[0].strip()
+    ex_details = parts[1].strip()
+
+    # Сдвигаем все последующие упражнения вниз
+    cursor.execute("UPDATE exercises SET order_num = order_num + 1 WHERE split_id = ? AND order_num >= ?", (split_id, target_pos))
+    # Вставляем новое упражнение на выбранное место
+    cursor.execute("INSERT INTO exercises (split_id, name, details, order_num) VALUES (?, ?, ?, ?)", (split_id, ex_name, ex_details, target_pos))
+    conn.commit()
+    await state.clear()
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📋 Повернутися до спліту", callback_data=f"split_{split_id}")
+    builder.adjust(1)
+    
+    await message.answer(f"✅ Вправу <b>{ex_name}</b> додано під номером {target_pos}!", reply_markup=builder.as_markup(), parse_mode="HTML")
+
+# --- УДАЛЕНИЕ УПРАЖНЕНИЯ ПО НОМЕРУ ---
+@router.callback_query(F.data.startswith("del_ex_"))
+async def process_del_exercise_btn(callback: CallbackQuery, state: FSMContext):
+    split_id = callback.data.split("_")[2]
+    await state.update_data(split_id=split_id)
+    
+    cursor.execute("SELECT COUNT(*) FROM exercises WHERE split_id = ?", (split_id,))
+    count = cursor.fetchone()[0]
+    
+    await callback.message.answer(
+        f"Введіть <b>номер вправи</b>, яку потрібно видалити (від 1 до {count}):",
+        reply_markup=get_cancel_keyboard(),
+        parse_mode="HTML"
+    )
+    await state.set_state(DeleteExercise.waiting_for_number)
+    await callback.answer()
+
+@router.message(DeleteExercise.waiting_for_number)
+async def process_delete_exercise_confirm(message: Message, state: FSMContext):
+    data = await state.get_data()
+    split_id = data['split_id']
+    
+    cursor.execute("SELECT id, name FROM exercises WHERE split_id = ? AND order_num = ?", (split_id, message.text.strip()))
+    row = cursor.fetchone()
+    
+    if not row:
+        await message.answer("⚠️ Вправу з таким номером не знайдено. Спробуйте ще раз:", reply_markup=get_cancel_keyboard())
+        return
+
+    ex_id, ex_name = row
+    deleted_num = int(message.text.strip())
+    
+    # Удаляем упражнение
+    cursor.execute("DELETE FROM exercises WHERE id = ?", (ex_id,))
+    # Сдвигаем номера оставшихся упражнений вверх
+    cursor.execute("UPDATE exercises SET order_num = order_num - 1 WHERE split_id = ? AND order_num > ?", (split_id, deleted_num))
+    conn.commit()
+    await state.clear()
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📋 Повернутися до спліту", callback_data=f"split_{split_id}")
+    builder.adjust(1)
+    
+    await message.answer(f"🗑️ Вправу №{deleted_num} (<b>{ex_name}</b>) видалено!", reply_markup=builder.as_markup(), parse_mode="HTML")
+
+# --- УПРАВЛЕНИЕ СПЛИТОМ: ПЕРЕИМЕНОВАНИЕ И УДАЛЕНИЕ СПЛИТА ---
 @router.callback_query(F.data.startswith("add_split_"))
 async def process_add_split_button(callback: CallbackQuery, state: FSMContext):
     client_id = callback.data.split("_")[2]
@@ -347,49 +482,6 @@ async def process_split_new_name(message: Message, state: FSMContext):
     builder.adjust(1)
     
     await message.answer(f"✅ Назву змінено на: <b>{new_name}</b>", reply_markup=builder.as_markup(), parse_mode="HTML")
-
-@router.callback_query(F.data.startswith("append_ex_"))
-async def process_append_exercises_button(callback: CallbackQuery, state: FSMContext):
-    split_id = callback.data.split("_")[2]
-    await state.update_data(split_id=split_id)
-    await callback.message.answer(
-        "Відправте нові вправи списком (назва та підходи через двокрапку).\nПриклад:\nПідтягування: 4х10",
-        reply_markup=get_cancel_keyboard()
-    )
-    await state.set_state(AppendExercises.waiting_for_exercises)
-    await callback.answer()
-
-@router.message(AppendExercises.waiting_for_exercises)
-async def process_append_exercises_save(message: Message, state: FSMContext):
-    data = await state.get_data()
-    split_id = data['split_id']
-    
-    lines = message.text.split('\n')
-    added_count = 0
-    for line in lines:
-        if not line.strip():
-            continue
-        try:
-            parts = line.split(':', 1)
-            cursor.execute(
-                "INSERT INTO exercises (split_id, name, details) VALUES (?, ?, ?)",
-                (split_id, parts[0].strip(), parts[1].strip())
-            )
-            added_count += 1
-        except Exception:
-            pass
-            
-    cursor.execute("SELECT client_id FROM splits WHERE id = ?", (split_id,))
-    client_id = cursor.fetchone()[0]
-    conn.commit()
-    await state.clear()
-    
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📋 Переглянути спліт", callback_data=f"split_{split_id}")
-    builder.button(text="🏋️ До клієнта", callback_data=f"client_{client_id}")
-    builder.adjust(1)
-    
-    await message.answer(f"✅ Додано нових вправ: {added_count}", reply_markup=builder.as_markup())
 
 @router.callback_query(F.data.startswith("delete_split_"))
 async def process_delete_split(callback: CallbackQuery):
