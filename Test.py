@@ -540,7 +540,7 @@ async def render_live_workout(message_or_call, state: FSMContext, is_edit=True):
         builder.button(text="+5", callback_data="wstep_+5")
         builder.button(text="+10", callback_data="wstep_+10")
         # Ряд 3: Ручне введення
-        builder.button(text="✏️ Вказати підхід вручну", callback_data="wstep_custom")
+        builder.button(text="✏️ Вказати вагу вручну", callback_data="wstep_custom")
         # Ряд 4: Фіксація підходу
         builder.button(text=f"✅ Зафіксувати підхід {cur_set_idx + 1}", callback_data="wstep_confirm")
     else:
