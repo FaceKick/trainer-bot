@@ -160,32 +160,30 @@ def get_cancel_keyboard():
 
 def parse_sets_string(details: str):
     parsed = []
-    # Умный поиск: берем всё до слэша/крестика (вес) и цифры после (повторы)
     matches = list(re.finditer(r'([^xXхХ/]+)\s*[xXхХ/]\s*(\d+)', details))
     
     if not matches:
-        # Если слэшей вообще нет, просто отдаем как сырой текст
         raw_sets = [s.strip() for s in details.split(",") if s.strip()]
         for s in raw_sets:
             parsed.append({"weight": None, "reps": None, "raw": s})
         return parsed if parsed else [{"weight": 0, "reps": 10, "raw": details}]
 
     for m in matches:
-        # Очищаем от случайных пробелов и запятых по краям (отделителей подходов)
         w_str = m.group(1).strip(' ,.\t')
         r_str = m.group(2)
         
-        # Меняем дробную запятую на точку для правильной математики Python (1,25 -> 1.25)
-        w_str_clean = w_str.replace(',', '.')
+        # Вытягиваем только цифры, точки и запятые, игнорируя буквы (например "кг")
+        w_str_clean = re.sub(r'[^\d\.,]', '', w_str).replace(',', '.')
         
         try:
+            if not w_str_clean:
+                raise ValueError
             w_val = float(w_str_clean)
             if w_val.is_integer():
                 w_val = int(w_val)
             parsed.append({"weight": w_val, "reps": int(r_str), "raw": f"{w_str}/{r_str}"})
         except ValueError:
-            # Если вместо веса текст (например, "пустий")
-            parsed.append({"weight": None, "reps": None, "raw": f"{w_str}/{r_str}"})
+            parsed.append({"weight": None, "reps": None, "raw": f"{w_str.strip()}/{r_str}"})
             
     return parsed
 
@@ -194,7 +192,6 @@ def format_sets_string(sets_list):
     for s in sets_list:
         if s.get("weight") is not None and s.get("reps") is not None:
             w = s['weight']
-            # Убираем .0 у целых чисел (40.0 -> 40), но оставляем у дробей (1.25)
             if isinstance(w, float) and w.is_integer():
                 w = int(w)
             res.append(f"{w}/{s['reps']}")
@@ -551,26 +548,27 @@ async def render_live_workout(message_or_call, state: FSMContext, is_edit=True):
 
     builder = InlineKeyboardBuilder()
     if cur_set_idx < len(sets):
-        # Ряд 1: Шаг дисков (1.25, 2.5)
         builder.button(text="-2.5", callback_data="wstep_-2.5")
         builder.button(text="-1.25", callback_data="wstep_-1.25")
         builder.button(text="+1.25", callback_data="wstep_+1.25")
         builder.button(text="+2.5", callback_data="wstep_+2.5")
-        # Ряд 2: Крупный шаг (5, 10)
+        
         builder.button(text="-10", callback_data="wstep_-10")
         builder.button(text="-5", callback_data="wstep_-5")
         builder.button(text="+5", callback_data="wstep_+5")
         builder.button(text="+10", callback_data="wstep_+10")
-        # Ряд 3: Ручной ввод
-        builder.button(text="✏️ Вказати вагу вручну", callback_data="wstep_custom")
-        # Ряд 4: Фиксация подхода (четкий callback: confirm)
+        
+        builder.button(text="✏️ Вручну", callback_data="wstep_custom")
+        builder.button(text="➕ Додати підхід", callback_data="wstep_addset")
+        
         builder.button(text=f"✅ Зафіксувати підхід {cur_set_idx + 1}", callback_data="wstep_confirm")
+        builder.button(text="❌ Завершити тренування", callback_data=f"split_{data.get('split_id')}")
+        builder.adjust(4, 4, 2, 1, 1)
     else:
-        # Все подходы упражнения выполнены -> кнопка перехода
+        builder.button(text="➕ Додати ще підхід", callback_data="wstep_addset")
         builder.button(text="➡️ Наступна вправа", callback_data="wstep_next")
-
-    builder.button(text="❌ Завершити тренування", callback_data=f"split_{data.get('split_id')}")
-    builder.adjust(4, 4, 1, 1, 1)
+        builder.button(text="❌ Завершити тренування", callback_data=f"split_{data.get('split_id')}")
+        builder.adjust(1, 1, 1)
 
     if is_edit:
         try:
@@ -579,39 +577,6 @@ async def render_live_workout(message_or_call, state: FSMContext, is_edit=True):
             pass
     else:
         await message_or_call.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
-
-@router.callback_query(F.data.startswith("start_workout_"))
-async def process_start_workout(callback: CallbackQuery, state: FSMContext):
-    split_id = callback.data.split("_")[2]
-    cursor.execute("SELECT client_id FROM splits WHERE id = ?", (split_id,))
-    client_id = cursor.fetchone()[0]
-
-    cursor.execute("SELECT id, name, details, order_num FROM exercises WHERE split_id = ? ORDER BY order_num ASC", (split_id,))
-    rows = cursor.fetchall()
-    if not rows:
-        await callback.answer("У цьому спліті немає вправ для тренування.")
-        return
-
-    workout_exercises = []
-    for ex_id, name, details, order_num in rows:
-        workout_exercises.append({
-            "id": ex_id,
-            "name": name,
-            "order_num": order_num,
-            "sets": parse_sets_string(details),
-            "cur_set_idx": 0
-        })
-
-    await state.clear()
-    await state.set_state(LiveWorkout.active)
-    await state.update_data(
-        client_id=client_id,
-        split_id=split_id,
-        workout_ex_index=0,
-        workout_exercises=workout_exercises
-    )
-    await render_live_workout(callback, state, is_edit=True)
-    await callback.answer()
 
 @router.callback_query(LiveWorkout.active, F.data.startswith("wstep_"))
 async def process_workout_step_buttons(callback: CallbackQuery, state: FSMContext):
@@ -622,7 +587,6 @@ async def process_workout_step_buttons(callback: CallbackQuery, state: FSMContex
     cur_ex = exercises[ex_index]
     cur_set_idx = cur_ex["cur_set_idx"]
 
-    # Быстрый шаг веса
     if action in ["+1.25", "-1.25", "+2.5", "-2.5", "+5", "-5", "+10", "-10"]:
         delta = float(action)
         cur_set = cur_ex["sets"][cur_set_idx]
@@ -635,15 +599,25 @@ async def process_workout_step_buttons(callback: CallbackQuery, state: FSMContex
         await callback.answer(f"{cur_set['weight']} кг")
         return
 
-    # Нажатие «Зафіксувати підхід»
     elif action == "confirm":
         cur_ex["cur_set_idx"] += 1
         await state.update_data(workout_exercises=exercises)
         await render_live_workout(callback, state, is_edit=True)
         await callback.answer("✅ Підхід зараховано!")
         return
+        
+    elif action == "addset":
+        # Копируем параметры последнего подхода, либо создаем пустой
+        if cur_ex["sets"]:
+            last_set = cur_ex["sets"][-1].copy()
+        else:
+            last_set = {"weight": 0, "reps": 10, "raw": "0/10"}
+        cur_ex["sets"].append(last_set)
+        await state.update_data(workout_exercises=exercises)
+        await render_live_workout(callback, state, is_edit=True)
+        await callback.answer("➕ Додано новий підхід!")
+        return
 
-    # Нажатие «Наступна вправа»
     elif action == "next":
         formatted_details = format_sets_string(cur_ex["sets"])
         cursor.execute("UPDATE exercises SET details = ? WHERE id = ?", (formatted_details, cur_ex["id"]))
@@ -661,7 +635,6 @@ async def process_workout_step_buttons(callback: CallbackQuery, state: FSMContex
         await callback.answer()
         return
 
-    # Ручной ввод
     elif action == "custom":
         await state.set_state(LiveWorkout.waiting_custom_set)
         sent_msg = await callback.message.answer(
