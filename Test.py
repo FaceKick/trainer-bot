@@ -107,23 +107,22 @@ async def process_client_name(message: Message, state: FSMContext):
     await state.set_state(AddSplitFlow.waiting_for_split_name)
 
 # --- БЛОК ДОБАВЛЕНИЯ СПЛИТА ---
-@router.message(AddClientFlow.waiting_for_split)
+@router.message(AddSplitFlow.waiting_for_split_name)
 async def process_split_name(message: Message, state: FSMContext):
-    await state.update_data(split_name=message.text)
+    await state.update_data(split_name=message.text.strip())
     await message.answer(
-        "Відправте список вправ (назва та підходи через двокрапку).\n\n"
-        "Приклад:\n"
-        "Тяга вертикального блоку широким хватом: 30/14, 40/12, 50/10"
+        "Відправте список вправ (назва та підходи через двокрапку).\nПриклад:\nЖим лежачи: 60/10, 70/8",
+        reply_markup=get_cancel_keyboard()
     )
-    await state.set_state(AddClientFlow.waiting_for_exercises)
+    await state.set_state(AddSplitFlow.waiting_for_exercises)
 
-@router.message(AddClientFlow.waiting_for_exercises)
-async def process_exercises(message: Message, state: FSMContext):
+@router.message(AddSplitFlow.waiting_for_exercises)
+async def process_split_exercises(message: Message, state: FSMContext):
     data = await state.get_data()
-    client_name = data['client_name']
+    client_id = data['client_id']
     split_name = data['split_name']
     
-   cursor.execute("INSERT INTO splits (client_id, name) VALUES (?, ?)", (client_id, split_name))
+    cursor.execute("INSERT INTO splits (client_id, name) VALUES (?, ?)", (client_id, split_name))
     split_id = cursor.lastrowid
     
     lines = message.text.split('\n')
