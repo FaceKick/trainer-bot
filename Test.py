@@ -204,6 +204,17 @@ def format_sets_string(sets_list):
             res.append(s.get("raw", ""))
     return ", ".join(res)
 
+def get_latest_exercise_details(cursor, client_id, ex_name):
+    """Шукає останні робочі ваги для вправи по всіх сплітах клієнта."""
+    cursor.execute("""
+        SELECT e.details FROM exercises e
+        JOIN splits s ON e.split_id = s.id
+        WHERE s.client_id = ? AND LOWER(TRIM(e.name)) = LOWER(TRIM(?))
+        ORDER BY e.id DESC LIMIT 1
+    """, (client_id, ex_name))
+    row = cursor.fetchone()
+    return row[0] if row else None
+
 # --- 5. СИСТЕМНЫЕ КОМАНДЫ (START, UPDATE, BACKUP) ---
 
 @router.message(Command("start"))
@@ -332,15 +343,25 @@ async def process_split_exercises(message: Message, state: FSMContext):
     for line in lines:
         if not line.strip():
             continue
-        try:
-            parts = line.split(':', 1)
-            added_count += 1
-            cursor.execute(
-                "INSERT INTO exercises (split_id, name, details, order_num) VALUES (?, ?, ?, ?)",
-                (split_id, parts[0].strip(), parts[1].strip(), added_count)
-            )
-        except Exception:
-            pass
+            
+        parts = line.split(':', 1)
+        ex_name = parts[0].strip()
+        
+        # Шукаємо вагу з інших сплітів цього клієнта
+        last_details = get_latest_exercise_details(cursor, client_id, ex_name)
+        
+        if len(parts) > 1 and parts[1].strip():
+            ex_details = parts[1].strip()  # Якщо тренер ввів вагу руками - це пріоритет
+        elif last_details:
+            ex_details = last_details      # Бот сам знайшов старі ваги
+        else:
+            ex_details = "0/10"            # Нова вправа без вказаної ваги
+            
+        added_count += 1
+        cursor.execute(
+            "INSERT INTO exercises (split_id, name, details, order_num) VALUES (?, ?, ?, ?)",
+            (split_id, ex_name, ex_details, added_count)
+        )
             
     conn.commit()
     await clear_old_messages(bot, message.chat.id, state)
@@ -773,15 +794,23 @@ async def process_exercise_data_save(message: Message, state: FSMContext):
     split_id = data['split_id']
     target_pos = data['target_pos']
     
+    # Дізнаємося client_id для пошуку історії
+    cursor.execute("SELECT client_id FROM splits WHERE id = ?", (split_id,))
+    client_id = cursor.fetchone()[0]
+    
     text = message.text.strip()
-    if ":" not in text:
-        err_msg = await message.answer("⚠️ Розділіть назву і вагу двокрапкою (наприклад: <i>Тяга: 50/10</i>):", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
-        await save_msg(state, err_msg.message_id)
-        return
-        
     parts = text.split(":", 1)
     ex_name = parts[0].strip()
-    ex_details = parts[1].strip()
+    
+    # Шукаємо історію
+    last_details = get_latest_exercise_details(cursor, client_id, ex_name)
+    
+    if len(parts) > 1 and parts[1].strip():
+        ex_details = parts[1].strip()
+    elif last_details:
+        ex_details = last_details
+    else:
+        ex_details = "0/10"
 
     cursor.execute("UPDATE exercises SET order_num = order_num + 1 WHERE split_id = ? AND order_num >= ?", (split_id, target_pos))
     cursor.execute("INSERT INTO exercises (split_id, name, details, order_num) VALUES (?, ?, ?, ?)", (split_id, ex_name, ex_details, target_pos))
