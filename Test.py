@@ -159,24 +159,45 @@ def get_cancel_keyboard():
     ])
 
 def parse_sets_string(details: str):
-    """Разбивает строку подходов вроде '60/10, 70/8, 70/8' на список."""
-    raw_sets = [s.strip() for s in details.split(",") if s.strip()]
     parsed = []
-    for s in raw_sets:
-        match = re.search(r"([\d\.]+)\s*(?:[xXхХ/])\s*(\d+)", s)
-        if match:
-            w_str, r_str = match.groups()
-            w_val = float(w_str) if "." in w_str else int(w_str)
-            parsed.append({"weight": w_val, "reps": int(r_str), "raw": s})
-        else:
+    # Умный поиск: берем всё до слэша/крестика (вес) и цифры после (повторы)
+    matches = list(re.finditer(r'([^xXхХ/]+)\s*[xXхХ/]\s*(\d+)', details))
+    
+    if not matches:
+        # Если слэшей вообще нет, просто отдаем как сырой текст
+        raw_sets = [s.strip() for s in details.split(",") if s.strip()]
+        for s in raw_sets:
             parsed.append({"weight": None, "reps": None, "raw": s})
-    return parsed if parsed else [{"weight": 0, "reps": 10, "raw": details}]
+        return parsed if parsed else [{"weight": 0, "reps": 10, "raw": details}]
+
+    for m in matches:
+        # Очищаем от случайных пробелов и запятых по краям (отделителей подходов)
+        w_str = m.group(1).strip(' ,.\t')
+        r_str = m.group(2)
+        
+        # Меняем дробную запятую на точку для правильной математики Python (1,25 -> 1.25)
+        w_str_clean = w_str.replace(',', '.')
+        
+        try:
+            w_val = float(w_str_clean)
+            if w_val.is_integer():
+                w_val = int(w_val)
+            parsed.append({"weight": w_val, "reps": int(r_str), "raw": f"{w_str}/{r_str}"})
+        except ValueError:
+            # Если вместо веса текст (например, "пустий")
+            parsed.append({"weight": None, "reps": None, "raw": f"{w_str}/{r_str}"})
+            
+    return parsed
 
 def format_sets_string(sets_list):
     res = []
     for s in sets_list:
         if s.get("weight") is not None and s.get("reps") is not None:
-            res.append(f"{s['weight']}/{s['reps']}")
+            w = s['weight']
+            # Убираем .0 у целых чисел (40.0 -> 40), но оставляем у дробей (1.25)
+            if isinstance(w, float) and w.is_integer():
+                w = int(w)
+            res.append(f"{w}/{s['reps']}")
         else:
             res.append(s.get("raw", ""))
     return ", ".join(res)
