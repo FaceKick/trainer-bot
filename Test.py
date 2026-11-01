@@ -115,6 +115,8 @@ async def process_exercises(message: Message, state: FSMContext):
     await message.answer(f"✅ Клієнт <b>{client_name}</b> доданий!\nВправ збережено: {added_count}", parse_mode="HTML")
     await state.clear()
 
+
+
 # --- БЛОК ПРОСМОТРА КЛИЕНТОВ (/clients) ---
 @router.message(Command("clients"))
 async def cmd_show_clients(message: Message):
@@ -158,9 +160,37 @@ async def process_client_selection(callback: CallbackQuery):
         text += f"{i}. <b>{ex_name}</b>: {ex_details}\n"
         short_name = ex_name[:15] + "..." if len(ex_name) > 15 else ex_name
         builder.button(text=f"📝 {short_name}", callback_data=f"edit_weight_{ex_id}")
-        
+
+        # Добавляем красную кнопку удаления в самый низ клавиатуры
+    builder.button(text="🗑️ Видалити клієнта", callback_data=f"delete_client_{client_id}")
+    builder.adjust(1)
     builder.adjust(1)
     await callback.message.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+    await callback.answer()
+
+# --- УДАЛЕНИЕ КЛИЕНТА ---
+@router.callback_query(F.data.startswith("delete_client_"))
+async def process_delete_client(callback: CallbackQuery):
+    client_id = callback.data.split("_")[2]
+    
+    # Узнаем имя клиента перед удалением, чтобы красиво написать в ответе
+    cursor.execute("SELECT name FROM clients WHERE id = ?", (client_id,))
+    client_row = cursor.fetchone()
+    
+    if client_row:
+        client_name = client_row[0]
+        # Удаляем самого клиента и все его упражнения каскадом
+        cursor.execute("DELETE FROM exercises WHERE client_id = ?", (client_id,))
+        cursor.execute("DELETE FROM clients WHERE id = ?", (client_id,))
+        conn.commit()
+        
+        await callback.message.edit_text(
+            f"🗑️ Клієнт <b>{client_name}</b> та всі його тренування успішно видалені з бази.",
+            parse_mode="HTML"
+        )
+    else:
+        await callback.message.edit_text("⚠️ Клієнта вже не існує в базі.")
+        
     await callback.answer()
 
 # --- БЛОК ИЗМЕНЕНИЯ ВЕСА ---
