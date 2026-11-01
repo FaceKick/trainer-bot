@@ -53,7 +53,7 @@ class AddClientFlow(StatesGroup):
 
 class AddSplitFlow(StatesGroup):
     waiting_for_name = State()    
-     waiting_for_exercises = State()
+    waiting_for_exercises = State()
 
 class EditWeight(StatesGroup):
     waiting_for_new_weight = State()
