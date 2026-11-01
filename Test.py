@@ -160,32 +160,34 @@ def get_cancel_keyboard():
 
 def parse_sets_string(details: str):
     parsed = []
-    matches = list(re.finditer(r'([^xXхХ/]+)\s*[xXхХ/]\s*(\d+)', details))
+    # Розділяємо підходи по комі
+    raw_sets = [s.strip() for s in details.split(",") if s.strip()]
     
-    if not matches:
-        raw_sets = [s.strip() for s in details.split(",") if s.strip()]
-        for s in raw_sets:
-            parsed.append({"weight": None, "reps": None, "raw": s})
-        return parsed if parsed else [{"weight": 0, "reps": 10, "raw": details}]
-
-    for m in matches:
-        w_str = m.group(1).strip(' ,.\t')
-        r_str = m.group(2)
-        
-        # Вытягиваем только цифры, точки и запятые, игнорируя буквы (например "кг")
-        w_str_clean = re.sub(r'[^\d\.,]', '', w_str).replace(',', '.')
-        
-        try:
-            if not w_str_clean:
-                raise ValueError
-            w_val = float(w_str_clean)
-            if w_val.is_integer():
-                w_val = int(w_val)
-            parsed.append({"weight": w_val, "reps": int(r_str), "raw": f"{w_str}/{r_str}"})
-        except ValueError:
-            parsed.append({"weight": None, "reps": None, "raw": f"{w_str.strip()}/{r_str}"})
+    for s in raw_sets:
+        # Шукаємо вагу і повторення, розділені х або /
+        match = re.search(r'(.+?)\s*[xXхХ/]\s*(\d+)', s)
+        if match:
+            w_str = match.group(1).strip()
+            r_str = match.group(2)
             
-    return parsed
+            # Витягуємо тільки цифри, крапки і коми для ваги
+            w_str_clean = re.sub(r'[^\d\.,]', '', w_str).replace(',', '.')
+            
+            try:
+                if not w_str_clean:
+                    raise ValueError
+                w_val = float(w_str_clean)
+                if w_val.is_integer():
+                    w_val = int(w_val)
+                parsed.append({"weight": w_val, "reps": int(r_str), "raw": f"{w_val}/{r_str}"})
+            except ValueError:
+                # Якщо це просто текст (наприклад "пустий")
+                parsed.append({"weight": None, "reps": None, "raw": s})
+        else:
+            # Якщо формат зовсім незрозумілий, просто зберігаємо сирий текст
+            parsed.append({"weight": None, "reps": None, "raw": s})
+            
+    return parsed if parsed else [{"weight": 0, "reps": 10, "raw": details}]
 
 def format_sets_string(sets_list):
     res = []
@@ -578,6 +580,39 @@ async def render_live_workout(message_or_call, state: FSMContext, is_edit=True):
     else:
         await message_or_call.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
 
+@router.callback_query(F.data.startswith("start_workout_"))
+async def process_start_workout(callback: CallbackQuery, state: FSMContext):
+    split_id = callback.data.split("_")[2]
+    cursor.execute("SELECT client_id FROM splits WHERE id = ?", (split_id,))
+    client_id = cursor.fetchone()[0]
+
+    cursor.execute("SELECT id, name, details, order_num FROM exercises WHERE split_id = ? ORDER BY order_num ASC", (split_id,))
+    rows = cursor.fetchall()
+    if not rows:
+        await callback.answer("У цьому спліті немає вправ для тренування.")
+        return
+
+    workout_exercises = []
+    for ex_id, name, details, order_num in rows:
+        workout_exercises.append({
+            "id": ex_id,
+            "name": name,
+            "order_num": order_num,
+            "sets": parse_sets_string(details),
+            "cur_set_idx": 0
+        })
+
+    await state.clear()
+    await state.set_state(LiveWorkout.active)
+    await state.update_data(
+        client_id=client_id,
+        split_id=split_id,
+        workout_ex_index=0,
+        workout_exercises=workout_exercises
+    )
+    await render_live_workout(callback, state, is_edit=True)
+    await callback.answer()
+
 @router.callback_query(LiveWorkout.active, F.data.startswith("wstep_"))
 async def process_workout_step_buttons(callback: CallbackQuery, state: FSMContext):
     action = callback.data.replace("wstep_", "")
@@ -607,7 +642,6 @@ async def process_workout_step_buttons(callback: CallbackQuery, state: FSMContex
         return
         
     elif action == "addset":
-        # Копируем параметры последнего подхода, либо создаем пустой
         if cur_ex["sets"]:
             last_set = cur_ex["sets"][-1].copy()
         else:
@@ -659,7 +693,7 @@ async def process_custom_set_input(message: Message, state: FSMContext):
     if match:
         w_str, r_str = match.groups()
         w_val = float(w_str) if "." in w_str else int(w_str)
-        cur_ex["sets"][cur_set_idx] = {"weight": w_val, "reps": int(r_str), "raw": text}
+        cur_ex["sets"][cur_set_idx] = {"weight": w_val, "reps": int(r_str), "raw": f"{w_val}/{r_str}"}
     else:
         cur_ex["sets"][cur_set_idx] = {"weight": None, "reps": None, "raw": text}
 
