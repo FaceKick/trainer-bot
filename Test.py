@@ -160,18 +160,21 @@ def get_cancel_keyboard():
 
 def parse_sets_string(details: str):
     parsed = []
-    # Розділяємо підходи по комі
-    raw_sets = [s.strip() for s in details.split(",") if s.strip()]
+    # 1. РЯТУЄМО ДРОБИ: змінюємо кому між цифрами на крапку (1,25 -> 1.25)
+    clean_details = re.sub(r'(\d),(\d)', r'\1.\2', details)
+    
+    # 2. Тепер безпечно розділяємо підходи по комі
+    raw_sets = [s.strip() for s in clean_details.split(",") if s.strip()]
     
     for s in raw_sets:
-        # Шукаємо вагу і повторення, розділені х або /
+        # Шукаємо вагу і повторення
         match = re.search(r'(.+?)\s*[xXхХ/]\s*(\d+)', s)
         if match:
             w_str = match.group(1).strip()
             r_str = match.group(2)
             
-            # Витягуємо тільки цифри, крапки і коми для ваги
-            w_str_clean = re.sub(r'[^\d\.,]', '', w_str).replace(',', '.')
+            # Витягуємо тільки цифри і крапки для ваги
+            w_str_clean = re.sub(r'[^\d\.]', '', w_str)
             
             try:
                 if not w_str_clean:
@@ -181,10 +184,10 @@ def parse_sets_string(details: str):
                     w_val = int(w_val)
                 parsed.append({"weight": w_val, "reps": int(r_str), "raw": f"{w_val}/{r_str}"})
             except ValueError:
-                # Якщо це просто текст (наприклад "пустий")
+                # Якщо це текст ("пустий")
                 parsed.append({"weight": None, "reps": None, "raw": s})
         else:
-            # Якщо формат зовсім незрозумілий, просто зберігаємо сирий текст
+            # Якщо текст замість повторів (наприклад, "максимум")
             parsed.append({"weight": None, "reps": None, "raw": s})
             
     return parsed if parsed else [{"weight": 0, "reps": 10, "raw": details}]
@@ -689,13 +692,24 @@ async def process_custom_set_input(message: Message, state: FSMContext):
     cur_ex = exercises[ex_index]
     cur_set_idx = cur_ex["cur_set_idx"]
 
-    match = re.search(r"([\d\.]+)\s*(?:[xXхХ/])\s*(\d+)", text)
+    # Міняємо кому на крапку, якщо вона між цифрами
+    clean_text = re.sub(r'(\d),(\d)', r'\1.\2', text)
+
+    match = re.search(r'(.+?)\s*[xXхХ/]\s*(\d+)', clean_text)
     if match:
         w_str, r_str = match.groups()
-        w_val = float(w_str) if "." in w_str else int(w_str)
-        cur_ex["sets"][cur_set_idx] = {"weight": w_val, "reps": int(r_str), "raw": f"{w_val}/{r_str}"}
+        w_str_clean = re.sub(r'[^\d\.]', '', w_str)
+        try:
+            if not w_str_clean:
+                raise ValueError
+            w_val = float(w_str_clean)
+            if w_val.is_integer():
+                w_val = int(w_val)
+            cur_ex["sets"][cur_set_idx] = {"weight": w_val, "reps": int(r_str), "raw": f"{w_val}/{r_str}"}
+        except ValueError:
+            cur_ex["sets"][cur_set_idx] = {"weight": None, "reps": None, "raw": clean_text}
     else:
-        cur_ex["sets"][cur_set_idx] = {"weight": None, "reps": None, "raw": text}
+        cur_ex["sets"][cur_set_idx] = {"weight": None, "reps": None, "raw": clean_text}
 
     await clear_old_messages(bot, message.chat.id, state)
     await state.set_state(LiveWorkout.active)
